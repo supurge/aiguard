@@ -1,11 +1,11 @@
 --[[
-Aggressive Guard AI with Command System & Pathfinding Fallback
+Aggressive Guard AI with Command System & Pathfinding State Machine
 
--- V17 (Pathfinding Integration) --
-- This script integrates Roblox's PathfindingService as a fallback mechanism.
-- When the AI detects it is stuck on an object while chasing a target, it will compute a path to get around it.
-- This improves the AI's navigation and ability to pursue targets in complex environments.
-- All original V16 functionality remains intact.
+-- V18 (Robust Pathfinding State) --
+- This script now features a dedicated "PATHFINDING" state.
+- The instant the AI detects it is stuck, it computes a full path to the target and follows it.
+- It will intelligently abandon the path if the target moves too far, ensuring it doesn't follow a stale route.
+- This creates a much more reliable and persistent navigation system when obstacles are present.
 
 ]]
 
@@ -41,10 +41,12 @@ local currentAIState = "IDLE"
 local lastVoicelineTime = 0
 local forcedTarget = nil
 
--- NEW: Stuck detection variables
+-- NEW: Stuck detection and Pathfinding variables
 local lastPosition = Vector3.new()
 local stuckTimer = 0
-local STUCK_TIME_THRESHOLD = 2 -- seconds before pathfinding kicks in
+local STUCK_TIME_THRESHOLD = 1.5 -- Reduced time to trigger pathfinding faster
+local activePath = nil
+local nextWaypointIndex = 1
 
 -- Voiceline Configuration Table
 local voicelines = {
@@ -316,35 +318,10 @@ local function findClosestTargetInZone()
 end
 
 --===================================================================================
--- AGILE MOVEMENT LOGIC (NOW WITH PATHFINDING FALLBACK)
+-- AGILE MOVEMENT LOGIC
 --===================================================================================
--- NEW: The function now decides whether to use pathfinding based on the 'isStuck' flag
-local function handleAgileMovement(destination, myRootPart, targetCharacter, isStuck)
-	
-	-- NEW: If the AI is determined to be stuck, force pathfinding.
-	if isStuck then
-		print("AI is stuck, calculating new path...")
-		local path = PathfindingService:CreatePath(pathfindingParams)
-		path:ComputeAsync(myRootPart.Position, destination)
-		
-		if path.Status == Enum.PathStatus.Success then
-			local waypoints = path:GetWaypoints()
-			-- Move to the second waypoint to get unstuck. The AI will then resume normal logic.
-			if #waypoints >= 2 then
-				humanoid:MoveTo(waypoints[2].Position)
-			else
-				-- If path is too short, just try moving to the destination directly
-				humanoid:MoveTo(destination)
-			end
-		else
-			-- If pathfinding fails, fall back to the old method as a last resort.
-			warn("Pathfinding failed, attempting direct movement.")
-			humanoid:MoveTo(destination)
-		end
-		return -- End the function here after handling the stuck case
-	end
-	
-	-- This is the original "agile" logic that runs when not stuck
+-- MODIFIED: This function is now only for direct movement, pathfinding is handled by the main AI brain.
+local function handleAgileMovement(destination, myRootPart, targetCharacter)
 	local origin = myRootPart.Position
 	local direction = destination - origin
 	
@@ -360,17 +337,10 @@ local function handleAgileMovement(destination, myRootPart, targetCharacter, isS
 			humanoid.Jump = true
 			humanoid:MoveTo(destination)
 		else
-			-- This is the original pathfinding logic for tall obstacles, which is still useful.
-			local path = PathfindingService:CreatePath(pathfindingParams)
-			path:ComputeAsync(origin, destination)
-			if path.Status == Enum.PathStatus.Success then
-				local waypoints = path:GetWaypoints()
-				if #waypoints >= 2 then
-					humanoid:MoveTo(waypoints[2].Position)
-				else
-					humanoid:MoveTo(destination)
-				end
-			end
+			-- If the obstacle is too high for agile movement, this is another trigger to use pathfinding.
+			-- This is a fallback in case the 'stuck' detection fails.
+			print("Obstacle is too high, attempting to pathfind...")
+			currentAIState = "PATHFINDING_REQUEST" -- A temporary state to trigger pathfinding
 		end
 	end
 end
@@ -384,28 +354,27 @@ local function onHeartbeat(deltaTime)
 	local myRootPart = character and character:FindFirstChild("HumanoidRootPart")
 	if not myRootPart then return end
 	
-	-- NEW: Stuck detection logic
+	-- MODIFIED: Stuck detection logic
 	local isStuck = false
-	if currentAIState == "CHASING" or currentAIState == "HUNTING" then
-		-- Check the distance moved since the last frame
-		if (myRootPart.Position - lastPosition).Magnitude < 0.5 then
+	local isChasing = (currentAIState == "CHASING" or currentAIState == "HUNTING")
+	if isChasing then
+		if (myRootPart.Position - lastPosition).Magnitude < 0.5 * deltaTime * 60 then -- Scaled by framerate
 			stuckTimer = stuckTimer + deltaTime
 		else
-			-- If moved, reset the timer
 			stuckTimer = 0
 		end
 		
 		if stuckTimer > STUCK_TIME_THRESHOLD then
 			isStuck = true
-			stuckTimer = 0 -- Reset timer to avoid constant recalculation
+			stuckTimer = 0
 		end
 	else
-		-- Reset timer if not in a chasing state
 		stuckTimer = 0
 	end
-	lastPosition = myRootPart.Position -- Update last position for the next frame
+	lastPosition = myRootPart.Position
 	
 	
+	-- Handle Traveling State
 	if currentAIState == "TRAVELING" then
 		if (myRootPart.Position - guardedHitbox.Position).Magnitude < 10 then
 			say("traveling_end")
@@ -413,34 +382,91 @@ local function onHeartbeat(deltaTime)
 		end
 		return
 	end
+
+	-- NEW: State to handle pathfinding requests
+	local targetForPathfinding
+	if currentAIState == "PATHFINDING_REQUEST" then
+		targetForPathfinding = forcedTarget or findClosestTargetInZone()
+		if targetForPathfinding then
+			isStuck = true -- Force the 'isStuck' logic to run
+			currentAIState = "CHASING" -- Revert to a state that can use pathfinding
+		else
+			currentAIState = "RETURNING" -- No target, just return
+		end
+	end
+
+	-- NEW: Dedicated Pathfinding State
+	if currentAIState == "PATHFINDING" then
+		local targetCharacter = forcedTarget or findClosestTargetInZone()
+		if not targetCharacter or not activePath then
+			activePath = nil; currentAIState = "RETURNING"; return
+		end
+		
+		local targetRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
+		if not targetRootPart then
+			activePath = nil; currentAIState = "RETURNING"; return
+		end
+		
+		-- Check if the target has moved too far from the path's destination. If so, the path is stale.
+		local pathDestination = activePath[#activePath].Position
+		if (targetRootPart.Position - pathDestination).Magnitude > 20 then
+			print("Target moved, recalculating path.")
+			activePath = nil
+			currentAIState = "CHASING" -- Revert to chasing to get a new path or attack
+			return
+		end
+
+		-- Move to the current waypoint and check if we've arrived
+		local waypointPosition = activePath[nextWaypointIndex].Position
+		if (myRootPart.Position - waypointPosition).Magnitude < 4 then
+			nextWaypointIndex = nextWaypointIndex + 1
+			if nextWaypointIndex > #activePath then
+				print("Path complete. Resuming normal chase.")
+				activePath = nil
+				currentAIState = "CHASING"
+				return
+			end
+		end
+		-- Move to the next waypoint
+		humanoid:MoveTo(activePath[nextWaypointIndex].Position)
+		return -- IMPORTANT: End the function here to prevent other logic from running
+	end
 	
+	-- Handle Hunting State
 	if currentAIState == "HUNTING" then
 		local targetHumanoid = forcedTarget and forcedTarget:FindFirstChildOfClass("Humanoid")
 		if not forcedTarget or not forcedTarget.Parent or not targetHumanoid or targetHumanoid.Health <= 0 then
-			say("returning")
-			forcedTarget = nil
-			currentAIState = "RETURNING"
-			return
+			say("returning"); forcedTarget = nil; activePath = nil; currentAIState = "RETURNING"; return
 		end
 		
 		local targetRootPart = forcedTarget:FindFirstChild("HumanoidRootPart")
 		if not targetRootPart then return end
 		
 		local distanceToTarget = (myRootPart.Position - targetRootPart.Position).Magnitude
-		if distanceToTarget <= STOPPING_DISTANCE then
-			humanoid:MoveTo(myRootPart.Position)
-			if not isAttacking and selectedTool and selectedTool.Parent == character then
-				isAttacking = true; selectedTool:Activate(); task.wait(ATTACK_COOLDOWN); isAttacking = false
-			end
+		if distanceToTarget <= ATTACK_RANGE then
+			currentAIState = "CHASING" -- Transition to normal chase/attack logic
 		else
-			-- NEW: Pass the 'isStuck' status to the movement function
-			handleAgileMovement(targetRootPart.Position, myRootPart, forcedTarget, isStuck)
+			if isStuck then
+				local path = PathfindingService:CreatePath(pathfindingParams)
+				path:ComputeAsync(myRootPart.Position, targetRootPart.Position)
+				if path.Status == Enum.PathStatus.Success and #path:GetWaypoints() > 1 then
+					print("AI is stuck! Following a calculated path.")
+					activePath = path:GetWaypoints(); nextWaypointIndex = 2; currentAIState = "PATHFINDING"
+					humanoid:MoveTo(activePath[nextWaypointIndex].Position)
+				end
+			else
+				humanoid:MoveTo(targetRootPart.Position)
+			end
 		end
 		return
 	end
 	
+	-- Main Combat Logic (Idle, Chasing, Attacking)
 	local targetCharacter = findClosestTargetInZone()
-	
+	if not targetCharacter and currentAIState ~= "RETURNING" then
+		targetCharacter = targetForPathfinding
+	end
+
 	if targetCharacter then
 		local targetRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
 		if not targetRootPart then return end
@@ -456,21 +482,34 @@ local function onHeartbeat(deltaTime)
 		else
 			if currentAIState ~= "CHASING" then say("engagement") end
 			currentAIState = "CHASING"
-			-- NEW: Pass the 'isStuck' status to the movement function
-			handleAgileMovement(targetRootPart.Position, myRootPart, targetCharacter, isStuck)
+			
+			-- MODIFIED: Pathfinding trigger logic
+			if isStuck then
+				local path = PathfindingService:CreatePath(pathfindingParams)
+				path:ComputeAsync(myRootPart.Position, targetRootPart.Position)
+				if path.Status == Enum.PathStatus.Success and #path:GetWaypoints() > 1 then
+					print("AI is stuck! Following a calculated path.")
+					activePath = path:GetWaypoints(); nextWaypointIndex = 2; currentAIState = "PATHFINDING"
+					humanoid:MoveTo(activePath[nextWaypointIndex].Position)
+				else
+					handleAgileMovement(targetRootPart.Position, myRootPart, targetCharacter)
+				end
+			else
+				handleAgileMovement(targetRootPart.Position, myRootPart, targetCharacter)
+			end
 		end
 	else
+		activePath = nil -- Clear any path if the target is lost
 		if (myRootPart.Position - guardedHitbox.Position).Magnitude > 5 then
 			if currentAIState ~= "RETURNING" then say("returning") end
 			currentAIState = "RETURNING"
-			-- NEW: We pass 'false' for isStuck here because we don't need advanced pathfinding for simple returning
-			handleAgileMovement(guardedHitbox.Position, myRootPart, nil, false)
+			humanoid:MoveTo(guardedHitbox.Position)
 		else
 			if currentAIState ~= "IDLE" then currentAIState = "IDLE" end
 		end
 	end
-	
 end
+
 
 --===================================================================================
 -- HELPER FUNCTION FOR ROBUST PLAYER SEARCH
@@ -518,6 +557,7 @@ local function onPlayerChatted(chattedPlayer, message)
 			end
 			
 			print("Received attack command for: " .. targetPlayer.Name)
+			activePath = nil -- Clear any previous path
 			forcedTarget = targetPlayer.Character
 			currentAIState = "HUNTING"
 			say("hunting", targetPlayer.Name)
@@ -525,50 +565,42 @@ local function onPlayerChatted(chattedPlayer, message)
 			print("Command error: Could not find player starting with '" .. targetName .. "'.")
 		end
 	elseif command == ".stop" then
-		if currentAIState == "HUNTING" then
+		if currentAIState == "HUNTING" or currentAIState == "PATHFINDING" then
 			print("Received stop command.")
+			activePath = nil -- Clear path on stop
 			forcedTarget = nil
 			currentAIState = "RETURNING"
 			say("stopping")
 		else
-			print("Command info: Not currently in HUNTING state.")
+			print("Command info: Not currently in an attack state.")
 		end
 	end
 	
 end
 
 --===================================================================================
--- INITIALIZATION (USING YOUR SUPERIOR V14.4 LOGIC)
+-- INITIALIZATION
 --===================================================================================
-
--- Function to handle connecting all necessary events for a player
 local function onPlayerAdded(newPlayer)
-	-- Update GUI lists
 	updatePlayerList()
 	updateWhitelistGUI()
 	
-	-- Connect the chat listener to the new player
 	newPlayer.Chatted:Connect(function(message)
 		onPlayerChatted(newPlayer, message)
 	end)
-	
 end
 
--- Connect the function for players who join after the script runs
 Players.PlayerAdded:Connect(onPlayerAdded)
 
--- Handle players who are already in the game when the script runs
 for _, existingPlayer in ipairs(Players:GetPlayers()) do
 	onPlayerAdded(existingPlayer)
 end
 
--- Update GUI when a player leaves
 Players.PlayerRemoving:Connect(function()
 	updatePlayerList()
 	updateWhitelistGUI()
 end)
 
--- Initial setup calls
 setGuardTarget(player)
 updateToolList()
 backpack.ChildAdded:Connect(updateToolList)
@@ -576,7 +608,7 @@ backpack.ChildRemoved:Connect(updateToolList)
 
 if guardedHitbox then
 	RunService.Heartbeat:Connect(onHeartbeat)
-	print("Commandable Guard AI (V17 - Pathfinding) is now active.")
+	print("Commandable Guard AI (V18 - Robust Pathfinding) is now active.")
 else
 	warn("AI could not start because no initial guard hitbox was found.")
 end
